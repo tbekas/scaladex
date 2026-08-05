@@ -1,5 +1,6 @@
-import ScalaJSHelper._
+import ScalaJSHelper.*
 import Deployment.githash
+import LgtmStack.autoImport.startLgtm
 
 lazy val isCI: Boolean = System.getenv("CI") != null
 
@@ -86,6 +87,7 @@ lazy val infra = project
     ),
     Elasticsearch.settings(defaultPort = 9200),
     Postgres.settings(Compile, defaultPort = 5432, database = "scaladex"),
+    LgtmStack.settings(),
     javaOptions ++= {
       val base = (ThisBuild / baseDirectory).value
       val index = base / "small-index"
@@ -98,9 +100,11 @@ lazy val infra = project
     Compile / run / javaOptions ++= {
       val elasticsearchPort = startElasticsearch.value
       val postgresPort = (Compile / startPostgres).value
+      val (_, _, otlpHttpPort) = startLgtm.value
       Seq(
         s"-Dscaladex.database.port=$postgresPort",
-        s"-Dscaladex.elasticsearch.port=$elasticsearchPort"
+        s"-Dscaladex.elasticsearch.port=$elasticsearchPort",
+        s"-Dotel.exporter.otlp.endpoint=http://localhost:$otlpHttpPort"
       )
     },
     Postgres.settings(Test, defaultPort = 5432, database = "scaladex-test"),

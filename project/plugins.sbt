@@ -9,5 +9,6 @@ addSbtPlugin("ch.epfl.scala" % "sbt-scalafix" % "0.14.4")
 libraryDependencies ++= Seq(
   "org.testcontainers" % "postgresql" % "1.21.3",
   "org.testcontainers" % "elasticsearch" % "1.21.3",
+  "org.testcontainers" % "testcontainers-grafana" % "2.0.5",
   "org.tpolecat" %% "doobie-postgres" % "0.13.4"
 )
