@@ -46,9 +46,11 @@ class AdminService(
       new JobScheduler(Job.userSessions, userSessionService.updateAll),
       new JobScheduler(Job.latestArtifacts, artifactService.updateAllLatestVersions)
     ) ++
-      githubClientOpt.map { client =>
-        val githubUpdater = new GithubUpdater(database, client)
-        new JobScheduler(Job.githubInfo, githubUpdater.updateAll)
+      githubClientOpt.map { _ =>
+//      client =>
+//        val githubUpdater = new GithubUpdater(database, client)
+//        new JobScheduler(Job.githubInfo, githubUpdater.updateAll)
+        new JobScheduler(Job.githubInfo, () => Future.successful("disabled"))
       } ++ (
         if !env.isLocal then
           Seq(
