@@ -83,6 +83,10 @@ lazy val infra = project
       "io.circe" %% "circe-core" % V.circe,
       "io.circe" %% "circe-generic" % V.circe,
       "io.circe" %% "circe-parser" % V.circe,
+      "io.opentelemetry" % "opentelemetry-api" % V.otel,
+      "io.opentelemetry" % "opentelemetry-sdk" % V.otel,
+      "io.opentelemetry" % "opentelemetry-exporter-otlp" % V.otel,
+      "io.opentelemetry" % "opentelemetry-sdk-extension-autoconfigure" % V.otel,
       "org.scalatest" %% "scalatest" % V.scalatest % "test,it"
     ),
     Elasticsearch.settings(defaultPort = 9200),
@@ -104,7 +108,14 @@ lazy val infra = project
       Seq(
         s"-Dscaladex.database.port=$postgresPort",
         s"-Dscaladex.elasticsearch.port=$elasticsearchPort",
-        s"-Dotel.exporter.otlp.endpoint=http://localhost:$otlpHttpPort"
+        s"-Dotel.exporter.otlp.endpoint=http://localhost:$otlpHttpPort",
+        "-Dotel.exporter.otlp.protocol=http/protobuf",
+        "-Dotel.service.name=scaladex",
+        "-Dotel.metrics.exporter=otlp",
+        "-Dotel.traces.exporter=otlp",
+        "-Dotel.logs.exporter=none",
+        // export metrics every 10s for a responsive local dashboard during load tests
+        "-Dotel.metric.export.interval=10000"
       )
     },
     Postgres.settings(Test, defaultPort = 5432, database = "scaladex-test"),
@@ -244,4 +255,5 @@ lazy val V = new {
   val circe = "0.14.12"
   val json4s = "4.1.0"
   val coursier = "2.1.24"
+  val otel = "1.64.0"
 }

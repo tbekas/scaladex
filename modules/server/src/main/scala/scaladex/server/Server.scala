@@ -14,8 +14,10 @@ import scaladex.infra.FilesystemStorage
 import scaladex.infra.GithubClientImpl
 import scaladex.infra.MavenCentralClientImpl
 import scaladex.infra.SqlDatabase
+import scaladex.infra.Telemetry
 import scaladex.infra.sql.DoobieUtils
 import scaladex.server.config.ServerConfig
+import scaladex.server.observability.MetricsDirectives.withHttpMetrics
 import scaladex.server.route.*
 import scaladex.server.route.api.*
 import scaladex.server.service.AdminService
@@ -39,6 +41,8 @@ object Server extends LazyLogging:
   def main(args: Array[String]): Unit =
     try
       val config: ServerConfig = ServerConfig.load()
+
+      Telemetry.init()
 
       logger.info(config.filesystem.toString)
 
@@ -192,6 +196,6 @@ object Server extends LazyLogging:
           complete(StatusCodes.InternalServerError, notfound(config.env, None))
         }
     }
-    handleExceptions(exceptionHandler)(route)
+    withHttpMetrics(handleExceptions(exceptionHandler)(route))
   end configureRoutes
 end Server

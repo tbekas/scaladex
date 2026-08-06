@@ -61,6 +61,17 @@ class ElasticsearchEngine(esClient: ElasticClient, index: String)(using Executio
 
   private val maxLanguagesOrPlatforms = 20
 
+  /** Wrap an Elasticsearch request in a span and record its duration, labeled by operation. */
+  private def timed[A](operation: String)(f: => Future[A]): Future[A] =
+    val start = System.nanoTime()
+    Telemetry.span(s"es.$operation") {
+      f.transform { result =>
+        val outcome = if result.isSuccess then "success" else "failure"
+        Telemetry.recordSearch(operation, outcome, (System.nanoTime() - start) / 1e9)
+        result
+      }
+    }
+
   private def waitUntilReady(): Future[Unit] = Future {
     var backoff = 0
     var done = false
@@ -81,10 +92,10 @@ class ElasticsearchEngine(esClient: ElasticClient, index: String)(using Executio
   def init(reset: Boolean): Future[Unit] =
     for
       _ <- waitUntilReady()
-      indexExists <- esClient.execute(indexExists(index)).map(_.result.isExists)
+      indexExists <- timed("index_exists")(esClient.execute(indexExists(index))).map(_.result.isExists)
       _ <-
         if !indexExists then create()
-        else if reset then esClient.execute(deleteIndex(index)).flatMap(_ => create())
+        else if reset then timed("delete_index")(esClient.execute(deleteIndex(index))).flatMap(_ => create())
         else Future.unit
     yield ()
 
@@ -101,8 +112,7 @@ class ElasticsearchEngine(esClient: ElasticClient, index: String)(using Executio
       .mapping(MappingDefinition(projectFields))
 
     logger.info(s"Creating index $index.")
-    esClient
-      .execute(createProject)
+    timed("create_index")(esClient.execute(createProject))
       .map { resp =>
         if resp.isError then logger.info(resp.error.reason)
         else ()
@@ -112,19 +122,19 @@ class ElasticsearchEngine(esClient: ElasticClient, index: String)(using Executio
   override def insert(project: ProjectDocument): Future[Unit] =
     val rawDocument = RawProjectDocument.from(project)
     val insertion = indexInto(index).withId(project.id).source(rawDocument)
-    esClient.execute(insertion).map(_ => ())
+    timed("insert")(esClient.execute(insertion)).map(_ => ())
 
   override def delete(reference: Project.Reference): Future[Unit] =
     val deletion = deleteById(index, reference.toString)
-    esClient.execute(deletion).map(_ => ())
+    timed("delete")(esClient.execute(deletion)).map(_ => ())
 
   def refresh(): Future[Unit] =
-    esClient.execute(refreshIndex(index)).map(_ => ())
+    timed("refresh")(esClient.execute(refreshIndex(index))).map(_ => ())
 
   override def count(): Future[Int] =
     val query = must(matchAllQuery())
     val request = search(index).query(query).size(0)
-    esClient.execute(request).map(_.result.totalHits.toInt)
+    timed("count")(esClient.execute(request)).map(_.result.totalHits.toInt)
 
   override def countByTopics(limit: Int): Future[Seq[TopicCount]] =
     countAllUnique("githubInfo.topics.keyword", matchAllQuery(), limit)
@@ -138,15 +148,15 @@ class ElasticsearchEngine(esClient: ElasticClient, index: String)(using Executio
 
   override def getMostDependedUpon(limit: Int): Future[Seq[ProjectDocument]] =
     val request = searchRequest(matchAllQuery(), Sorting.Dependent).limit(limit)
-    esClient.execute(request).map(extractDocuments)
+    timed("search")(esClient.execute(request)).map(extractDocuments)
 
   override def getLatest(limit: Int): Future[Seq[ProjectDocument]] =
     val request = searchRequest(matchAllQuery(), Sorting.Created).limit(limit)
-    esClient.execute(request).map(extractDocuments)
+    timed("search")(esClient.execute(request)).map(extractDocuments)
 
   override def autocomplete(params: SearchParams, limit: Int): Future[Seq[ProjectDocument]] =
     val request = searchRequest(filteredSearchQuery(params), params.sorting).limit(limit)
-    esClient.execute(request).map(extractDocuments)
+    timed("search")(esClient.execute(request)).map(extractDocuments)
 
   override def find(
       queryString: String,
@@ -181,17 +191,16 @@ class ElasticsearchEngine(esClient: ElasticClient, index: String)(using Executio
         case None => Future.successful(hits)
         case Some(id) =>
           for
-            r <- esClient.execute(searchScroll(id, keepAlive))
+            r <- timed("scroll")(esClient.execute(searchScroll(id, keepAlive)))
             nextHits <- recur(r)
           yield hits ++ nextHits
-    esClient.execute(request).flatMap(recur)
+    timed("scroll")(esClient.execute(request)).flatMap(recur)
   end scroll
 
   private def findPage(request: SearchRequest, page: PageParams): Future[Page[SearchHit]] =
     val clamp = if page.page <= 0 then 1 else page.page
     val pagedRequest = request.from(page.size * (clamp - 1)).size(page.size)
-    esClient
-      .execute(pagedRequest)
+    timed("search")(esClient.execute(pagedRequest))
       .map { response =>
         Page(
           Pagination(
@@ -321,7 +330,7 @@ class ElasticsearchEngine(esClient: ElasticClient, index: String)(using Executio
     val aggregation = termsAgg(aggName, field).size(limit)
 
     val request = search(index).query(query).aggregations(aggregation)
-    for response <- esClient.execute(request)
+    for response <- timed("aggregation")(esClient.execute(request))
     yield response.result.aggregations
       .result[Terms](aggName)
 

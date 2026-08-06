@@ -1,5 +1,6 @@
 import org.testcontainers.dockerclient.DockerClientProviderStrategy
 import org.testcontainers.grafana.LgtmStackContainer
+import org.testcontainers.utility.MountableFile
 import sbt._
 
 import java.io.IOException
@@ -31,24 +32,27 @@ object LgtmStack extends AutoPlugin {
     startLgtm := {
       import sbt.util.CacheImplicits._
       val baseDir = Keys.baseDirectory.value
+      val rootDir = (LocalRootProject / Keys.baseDirectory).value
+      val dashboardFile = rootDir / "observability" / "grafana" / "dashboards" / "scaladex-performance.json"
+      val providerFile = rootDir / "observability" / "grafana" / "provisioning" / "dashboards" / "scaladex.yaml"
       val streams = Keys.streams.value
       val logger = streams.log
 
       if (canConnect(defaultGrafanaPort)) {
-        logger.info(s"Lttm stack available on port $defaultGrafanaPort")
+        logger.info(s"Lgtm stack available on port $defaultGrafanaPort")
         (defaultGrafanaPort, defaultOltpGrpcPort, defaultOltpHttpPort)
       } else {
         val store = streams.cacheStoreFactory.make("lgtm-container")
         val tracker = util.Tracked.lastOutput[Unit, (String, Int, Int, Int)](store) {
           case (_, None) =>
-            startContainer(baseDir, logger)
+            startContainer(baseDir, dashboardFile, providerFile, logger)
           case (_, Some((containerId, grafanaPort, otlpGrpcPort, otlpHttpPort))) =>
             if (canConnect(grafanaPort)) {
               logger.info(s"Lgtm stack container already started on port $grafanaPort")
               (containerId, grafanaPort, otlpGrpcPort, otlpHttpPort)
             } else {
               Docker.kill(containerId)
-              startContainer(baseDir, logger)
+              startContainer(baseDir, dashboardFile, providerFile, logger)
             }
         }
         val (_, grafanaPort, otlpGrpcPort, otlpHttpPort) = tracker(())
@@ -62,9 +66,24 @@ object LgtmStack extends AutoPlugin {
     }
   )
 
-  private def startContainer(baseDir: File, logger: Logger): (String, Int, Int, Int) = {
+  private def startContainer(
+      baseDir: File,
+      dashboardFile: File,
+      providerFile: File,
+      logger: Logger
+  ): (String, Int, Int, Int) = {
     CurrentThread.setContextClassLoader[DockerClientProviderStrategy]
     val container = new LgtmStackContainer("grafana/otel-lgtm")
+
+    // provision the Scaladex performance dashboard so Grafana loads it on startup
+    container.withCopyFileToContainer(
+      MountableFile.forHostPath(providerFile.getAbsolutePath),
+      "/otel-lgtm/grafana/conf/provisioning/dashboards/scaladex.yaml"
+    )
+    container.withCopyFileToContainer(
+      MountableFile.forHostPath(dashboardFile.getAbsolutePath),
+      "/otel-lgtm/dashboards/scaladex-performance.json"
+    )
 
     val (grafanaPort, otlpGrpcPort, otlpHttpPort) =
       try {

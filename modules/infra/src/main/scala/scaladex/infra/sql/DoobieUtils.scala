@@ -11,16 +11,33 @@ import doobie.util.log.{ExecFailure, LogHandler, ProcessingFailure, Success}
 import org.flywaydb.core.Flyway
 
 import com.typesafe.scalalogging.LazyLogging
+import scaladex.infra.Telemetry
 
 object DoobieUtils extends LazyLogging:
 
   private given ContextShift[IO] =
     IO.contextShift(ExecutionContext.global)
 
-  implicit val logHandler: LogHandler = LogHandler {
+  enum SqlOperation(val label: String):
+    case Select extends SqlOperation("SELECT")
+    case Update extends SqlOperation("UPDATE")
+    case Insert extends SqlOperation("INSERT")
+    case Delete extends SqlOperation("DELETE")
+
+  /** Some builders receive a FROM-clause fragment (aliases, JOINs, possibly paren-wrapped) as their
+    * `table` argument rather than a bare table name. Reduce it to the primary table name so it is a
+    * usable, low-cardinality metric label.
+    */
+  private def primaryTable(table: String): String =
+    table.dropWhile(c => c == '(' || c.isWhitespace).takeWhile(c => c.isLetterOrDigit || c == '_')
+
+  def telemetryLogHandler(table: String, op: SqlOperation): LogHandler =
+    val tableLabel = primaryTable(table)
+    LogHandler {
 
     case Success(s, a, e1, e2) =>
-      logger.info(s"""Successful Statement Execution:
+      Telemetry.recordDb(op.label, tableLabel, "success", (e1.toNanos + e2.toNanos) / 1e9)
+      logger.debug(s"""Successful Statement Execution:
                      |
                      |  ${s.linesIterator.dropWhile(_.trim.isEmpty).mkString("\n  ")}
                      |
@@ -29,6 +46,7 @@ object DoobieUtils extends LazyLogging:
         """.stripMargin)
 
     case ProcessingFailure(s, a, e1, e2, t) =>
+      Telemetry.recordDb(op.label, tableLabel, "processing_failure", (e1.toNanos + e2.toNanos) / 1e9)
       logger.error(
         s"""Failed Resultset Processing:
            |
@@ -41,6 +59,7 @@ object DoobieUtils extends LazyLogging:
       )
 
     case ExecFailure(s, a, e1, t) =>
+      Telemetry.recordDb(op.label, tableLabel, "exec_failure", e1.toNanos / 1e9)
       logger.error(
         s"""Failed Statement Execution:
            |
@@ -52,6 +71,7 @@ object DoobieUtils extends LazyLogging:
         t
       )
   }
+  end telemetryLogHandler
 
   def flyway(conf: PostgreSQLConfig): Flyway =
     val datasource = getHikariDataSource(conf)
@@ -88,32 +108,39 @@ object DoobieUtils extends LazyLogging:
     val insert = insertRequest(table, insertFields).sql
     val onConflictFieldsStr = onConflictFields.mkString(",")
     val action = if updateFields.nonEmpty then updateFields.mkString(" UPDATE SET ", " = ?, ", " = ?") else "NOTHING"
+    given LogHandler = telemetryLogHandler(table, SqlOperation.Insert)
     Update(s"$insert ON CONFLICT ($onConflictFieldsStr) DO $action")
   end insertOrUpdateRequest
 
   def insertRequest[T: Write](table: String, fields: Seq[String]): Update[T] =
     val fieldsStr = fields.mkString(", ")
     val valuesStr = fields.map(_ => "?").mkString(", ")
+    given LogHandler = telemetryLogHandler(table, SqlOperation.Insert)
     Update(s"INSERT INTO $table ($fieldsStr) VALUES ($valuesStr)")
 
   def updateRequest[T: Write](table: String, fields: Seq[String], keys: Seq[String]): Update[T] =
     val fieldsStr = fields.map(f => s"$f=?").mkString(", ")
     val keysStr = keys.map(k => s"$k=?").mkString(" AND ")
+    given LogHandler = telemetryLogHandler(table, SqlOperation.Update)
     Update(s"UPDATE $table SET $fieldsStr WHERE $keysStr")
 
   def updateRequest0[T: Write](table: String, set: Seq[String], where: Seq[String]): Update[T] =
     val setStr = set.mkString(", ")
     val whereStr = where.mkString(" AND ")
+    given LogHandler = telemetryLogHandler(table, SqlOperation.Update)
     Update(s"UPDATE $table SET $setStr WHERE $whereStr")
 
   def selectRequest[A: Read](table: String, fields: Seq[String]): Query0[A] =
     val fieldsStr = fields.mkString(", ")
-    Query0(s"SELECT $fieldsStr FROM $table", logHandler = logHandler)
+    Query0(s"SELECT $fieldsStr FROM $table", logHandler = telemetryLogHandler(table, SqlOperation.Select))
 
   def selectRequest[A: Write, B: Read](table: String, fields: Seq[String], keys: Seq[String]): Query[A, B] =
     val fieldsStr = fields.mkString(", ")
     val keysStr = keys.map(k => s"$k=?").mkString(" AND ")
-    Query(s"SELECT $fieldsStr FROM $table WHERE $keysStr", logHandler0 = logHandler)
+    Query(
+      s"SELECT $fieldsStr FROM $table WHERE $keysStr",
+      logHandler0 = telemetryLogHandler(table, SqlOperation.Select)
+    )
 
   def selectRequest[A: Read](
       table: String,
@@ -128,7 +155,10 @@ object DoobieUtils extends LazyLogging:
     val groupByStr = if groupBy.nonEmpty then groupBy.mkString(" GROUP BY ", ", ", "") else ""
     val orderByStr = orderBy.map(o => s" ORDER BY $o").getOrElse("")
     val limitStr = limit.map(l => s" LIMIT $l").getOrElse("")
-    Query0(s"SELECT $fieldsStr FROM $table" + whereStr + groupByStr + orderByStr + limitStr, logHandler = logHandler)
+    Query0(
+      s"SELECT $fieldsStr FROM $table" + whereStr + groupByStr + orderByStr + limitStr,
+      logHandler = telemetryLogHandler(table, SqlOperation.Select)
+    )
   end selectRequest
 
   def selectRequest1[A: Write, B: Read](
@@ -146,10 +176,14 @@ object DoobieUtils extends LazyLogging:
     val groupByStr = if groupBy.nonEmpty then groupBy.mkString(" GROUP BY ", ", ", "") else ""
     val orderByStr = orderBy.map(o => s" ORDER BY $o").getOrElse("")
     val limitStr = limit.map(l => s" LIMIT $l").getOrElse("")
-    Query(s"SELECT $fieldsStr FROM $table" + whereStr + groupByStr + orderByStr + limitStr, logHandler0 = logHandler)
+    Query(
+      s"SELECT $fieldsStr FROM $table" + whereStr + groupByStr + orderByStr + limitStr,
+      logHandler0 = telemetryLogHandler(table, SqlOperation.Select)
+    )
   end selectRequest1
 
   def deleteRequest[T: Write](table: String, where: Seq[String]): Update[T] =
     val whereK = where.map(k => s"$k=?").mkString(" AND ")
+    given LogHandler = telemetryLogHandler(table, SqlOperation.Delete)
     Update(s"DELETE FROM $table WHERE $whereK")
 end DoobieUtils
