@@ -55,6 +55,28 @@ object ScalaExtensions:
           yield builder.addAll(bs)
         }
         .map(_.result())
+
+    /** Like [[mapSync]], but a failed item either aborts the whole batch or is recovered to a `fallback` value (keeping
+      * it in the results), as decided by the [[Tolerance]] instance in scope.
+      */
+    def mapSyncTolerant[B](
+        f: A => Future[B]
+    )(
+        fallback: (A, Throwable) => B
+    )(using tolerance: Tolerance, bf: BuildFrom[CC[A], B, CC[B]], ec: ExecutionContext): Future[CC[B]] =
+      in.iterator
+        .foldLeft(Future.successful(bf.newBuilder(in))) { (builderF, a) =>
+          builderF.flatMap { builder =>
+            f(a).transformWith {
+              case Success(b) => Future.successful(builder.addOne(b))
+              case Failure(e) =>
+                tolerance.decide(e) match
+                  case Tolerance.Decision.Tolerate => Future.successful(builder.addOne(fallback(a, e)))
+                  case Tolerance.Decision.Abort => Future.failed(e)
+            }
+          }
+        }
+        .map(_.result())
   end extension
 
   extension [A](iterator: Iterator[A])

@@ -12,6 +12,7 @@ import scaladex.core.service.SchedulerDatabase
 import scaladex.core.util.ScalaExtensions.*
 import scaladex.data.cleanup.NonStandardLib
 import scaladex.infra.DataPaths
+import scaladex.infra.HttpTolerance.given
 
 import com.typesafe.scalalogging.LazyLogging
 import org.apache.pekko.actor.ActorSystem
@@ -34,7 +35,7 @@ class MavenCentralService(
 
   def findNonStandard(): Future[String] =
     val nonStandardLibs = NonStandardLib.load(dataPaths)
-    for result <- nonStandardLibs.mapSync { lib =>
+    for result <- nonStandardLibs.mapSyncTolerant { lib =>
         val groupId = Artifact.GroupId(lib.groupId)
         // get should not throw: it is a fixed set of artifactIds
         val artifactId = Artifact.ArtifactId(lib.artifactId)
@@ -42,6 +43,9 @@ class MavenCentralService(
           knownRefs <- loadKnownRefs(groupId)
           inserted <- findAndIndexMissingArtifacts(groupId, artifactId, knownRefs)
         yield inserted
+      } { (lib, cause) =>
+        logger.error(s"Failed to index ${lib.groupId}:${lib.artifactId}", cause)
+        0
       }
     yield s"Inserted ${result.sum} missing poms"
   end findNonStandard
@@ -58,13 +62,21 @@ class MavenCentralService(
         if missingVersions.nonEmpty then
           logger.info(s"${missingVersions.size} artifacts are missing for ${groupId.value}:${artifactId.value}")
         else if versions.isEmpty then logger.warn(s"No versions listed for ${groupId.value}:${artifactId.value}")
-      missingPomFiles <- missingVersions.mapSync(ref => mavenCentralClient.getPomFile(ref).map(_.map(ref -> _)))
-      publishResult <- missingPomFiles.flatten.mapSync {
+      missingPomFiles <- missingVersions.mapSyncTolerant(ref =>
+        mavenCentralClient.getPomFile(ref).map(_.map(ref -> _))
+      ) { (ref, cause) =>
+        logger.error(s"Failed to fetch pom of $ref", cause)
+        None
+      }
+      publishResult <- missingPomFiles.flatten.mapSyncTolerant {
         case (mavenRef, (pomFile, creationDate)) =>
           for
             _ <- delay(publishDelay)
             result <- publishProcess.publishPom(mavenRef.toString(), pomFile, creationDate, None)
           yield result
+      } { (entry, cause) =>
+        logger.error(s"Failed to publish pom of ${entry._1}", cause)
+        PublishResult.Failed(cause.getMessage)
       }
     yield publishResult.count {
       case PublishResult.Success => true
@@ -76,7 +88,12 @@ class MavenCentralService(
       for
         batch <- database.getGroupIds(limit = groupIdPageSize, offset = page * groupIdPageSize)
         _ = logger.info(s"Processing group ID page $page (${batch.size} groups)")
-        inserted <- batch.mapSync(g => findAndIndexMissingArtifacts(g, None)).map(_.sum)
+        inserted <- batch
+          .mapSyncTolerant(g => findAndIndexMissingArtifacts(g, None)) { (g, cause) =>
+            logger.error(s"Failed to index group ${g.value}", cause)
+            0
+          }
+          .map(_.sum)
         total = totalInserted + inserted
         result <-
           if batch.size == groupIdPageSize then delay(pageDelay).flatMap(_ => loop(page + 1, total))
@@ -106,7 +123,12 @@ class MavenCentralService(
           s"All artifact IDs for ${groupId.value} were filtered out: ${artifactIds.map(_.value).mkString(", ")}"
         )
       result <- processPages(scalaArtifactIds, artifactIdPageSize) { batch =>
-        batch.mapSync(id => findAndIndexMissingArtifacts(groupId, id, knownRefs)).map(_.sum)
+        batch
+          .mapSyncTolerant(id => findAndIndexMissingArtifacts(groupId, id, knownRefs)) { (id, cause) =>
+            logger.error(s"Failed to index ${groupId.value}:${id.value}", cause)
+            0
+          }
+          .map(_.sum)
       }
     yield result
 
@@ -155,7 +177,10 @@ class MavenCentralService(
     for
       projectStatuses <- database.getAllProjectsStatuses()
       refs = projectStatuses.collect { case (ref, status) if status.isOk || status.isUnknown || status.isFailed => ref }
-      counts <- refs.mapSync(republishArtifacts)
+      counts <- refs.mapSyncTolerant(republishArtifacts) { (ref, cause) =>
+        logger.error(s"Failed to re-publish artifacts of $ref", cause)
+        (0, 0)
+      }
     yield
       val successes = counts.map(_._1).sum
       val failures = counts.map(_._2).sum
@@ -164,7 +189,10 @@ class MavenCentralService(
   private def republishArtifacts(projectRef: Project.Reference): Future[(Int, Int)] =
     for
       refs <- database.getProjectArtifactRefs(projectRef, stableOnly = false)
-      publishResult <- refs.mapSync(republishArtifact(projectRef, _))
+      publishResult <- refs.mapSyncTolerant(republishArtifact(projectRef, _)) { (ref, cause) =>
+        logger.error(s"Failed to re-publish $ref", cause)
+        PublishResult.Failed(cause.getMessage)
+      }
     yield
       val successes = publishResult.count(_ == PublishResult.Success)
       val failures = publishResult.size - successes
